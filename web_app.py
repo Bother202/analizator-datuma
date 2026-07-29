@@ -1,18 +1,16 @@
 import json
 import csv
 import re
-import threading
 from datetime import datetime, timezone, timedelta
-import requests
 from bs4 import BeautifulSoup
 from dateutil import parser
 from htmldate import find_date
 import streamlit as st
+import cloudscraper
 
 # Vremenska zona za našu regiju (CEST / UTC+2)
 CEST = timezone(timedelta(hours=2))
 
-# Mapa mjeseci na našim jezicima za sigurno parsiranje
 MONTHS_MAP = {
     'januar': '01', 'januara': '01', 'siječanj': '01', 'siječnja': '01',
     'februar': '02', 'februara': '02', 'veljača': '02', 'veljače': '02',
@@ -28,23 +26,7 @@ MONTHS_MAP = {
     'decembar': '12', 'decembra': '12', 'prosinac': '12', 'prosinca': '12'
 }
 
-# Napredna Chrome zaglavlja koja zaobilaze Cloudflare/Anti-Bot zaštite (Dnevno.hr, Klix, itd.)
-BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'hr-HR,hr;q=0.9,en-US;q=0.8,en;q=0.7,bs;q=0.6,sr;q=0.5',
-    'Sec-Ch-Ua': '"Not-A.Brand";v="99", "Chromium";v="124", "Google Chrome";v="124"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Upgrade-Insecure-Requests': '1'
-}
-
 def parse_relative_time(text):
-    """Pretvara relativno vrijeme poput 'Prije 2h' ili 'prije 45 min' u datetime."""
     now = datetime.now(CEST)
     text_lower = text.lower()
     
@@ -71,9 +53,8 @@ def parse_date_safely(date_str):
         return rel_dt
 
     try:
-        # Čišćenje specifičnih formata (npr. Slobodna Bosna "17. Jul. 20260")
         clean_str = date_str.strip()
-        clean_str = re.sub(r'(\d{4})\d$', r'\1', clean_str) # Uklanja višku nulu na kraju godine
+        clean_str = re.sub(r'(\d{4})\d$', r'\1', clean_str)
         
         clean_lower = clean_str.lower()
         for month_name, month_num in MONTHS_MAP.items():
@@ -90,21 +71,19 @@ def extract_published_date(url):
     html = ""
     
     try:
-        session = requests.Session()
-        session.headers.update(BROWSER_HEADERS)
-        
-        # Prvi pokušaj preuzimanja stranice
-        response = session.get(url, timeout=12, allow_redirects=True)
-        
-        # Ako je Cloudflare/server blokirao (403/503), pokušaj sa Google Referer zaglavljem
-        if response.status_code in [403, 503]:
-            session.headers.update({'Referer': 'https://www.google.com/'})
-            response = session.get(url, timeout=12, allow_redirects=True)
-            
+        # Inicijalizacija scrapera koji prolazi Cloudflare challenge
+        scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True
+            }
+        )
+        response = scraper.get(url, timeout=15)
         if response.status_code == 200:
             html = response.text
     except Exception as e:
-        print(f"[GREŠKA PRISTUPA] {url}: {e}")
+        print(f"[GREŠKA CLOUDSCRAPER] {url}: {e}")
         return None
 
     if not html:
@@ -112,7 +91,7 @@ def extract_published_date(url):
 
     soup = BeautifulSoup(html, 'html.parser')
 
-    # 1. SPECIFIČNO ZA SLOBODNU BOSNU (Zaobilazak lažnog dinamičkog meta tag-a)
+    # 1. Slobodna Bosna specifičnost
     if "slobodna-bosna.ba" in url:
         sb_elem = soup.find('div', class_='info') or \
                   soup.find('span', class_='date') or \
@@ -123,7 +102,7 @@ def extract_published_date(url):
             if text_match:
                 dt = parse_date_safely(text_match.group(0))
 
-    # 2. JSON-LD (Primarni izvor za Dnevno.hr i većinu portala)
+    # 2. JSON-LD
     if not dt:
         scripts = soup.find_all('script', type='application/ld+json')
         for script in scripts:
@@ -146,7 +125,7 @@ def extract_published_date(url):
             except Exception:
                 continue
 
-    # 3. META TAGOVI (article:published_time ili og:article:published_time)
+    # 3. Meta tagovi
     if not dt and "slobodna-bosna.ba" not in url:
         meta_selectors = [
             {'property': 'article:published_time'},
@@ -163,7 +142,7 @@ def extract_published_date(url):
                 if dt:
                     break
 
-    # 4. HTML5 <time> TAGOVI
+    # 4. HTML5 <time> tagovi
     if not dt:
         time_tags = soup.find_all('time')
         for tag in time_tags:
@@ -173,13 +152,12 @@ def extract_published_date(url):
                 if dt:
                     break
 
-    # 5. FALLBACK NA HTMLDATE BIBLIOTEKU
+    # 5. Fallback na htmldate
     if not dt:
         extracted_date_str = find_date(html)
         if extracted_date_str:
             dt = parse_date_safely(extracted_date_str)
 
-    # Normalizacija u CEST zonu
     if dt:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=CEST)
@@ -189,18 +167,13 @@ def extract_published_date(url):
 
     return None
 
-# ==============================================================================
-# STREAMLIT INTERFEJS (Za pokretanje na Streamlit Cloud-u)
-# ==============================================================================
 def main():
     st.set_page_config(page_title="Analizator Vremena Objave Članaka", page_icon="⏱️", layout="wide")
-    
     st.title("⏱️ Analizator Vremena Objave Članaka")
-    st.write("Unesite URL-ove novinskih članaka (svaki u novi red) da biste izvući tačan datum i vrijeme objave.")
-
+    
     urls_input = st.text_area("Unesite URL-ove ovdje:", height=180, placeholder="https://www.dnevno.hr/...\nhttps://www.slobodna-bosna.ba/...")
 
-    col1, col2 = st.columns([1, 4])
+    col1, _ = st.columns([1, 4])
     with col1:
         sort_option = st.radio("Sortiranje:", ("Najnovije prvo", "Najstarije prvo"))
     
@@ -231,7 +204,6 @@ def main():
 
         final_data = valid_results + failed_results
 
-        # Priprema za prikaz u tabeli
         table_data = []
         for idx, item in enumerate(final_data, 1):
             table_data.append({
