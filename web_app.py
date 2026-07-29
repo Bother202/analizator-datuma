@@ -1,0 +1,235 @@
+import json
+import csv
+import re
+import io
+from datetime import datetime, timezone, timedelta
+import requests
+from bs4 import BeautifulSoup
+from dateutil import parser
+from htmldate import find_date
+import streamlit as st
+
+# Postavke stranice
+st.set_page_config(page_title="Analizator Datuma Objave", page_icon="📅", layout="wide")
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
+
+CEST = timezone(timedelta(hours=2))
+
+MONTHS_MAP = {
+    'januar': '01', 'januara': '01', 'siječanj': '01', 'siječnja': '01',
+    'februar': '02', 'februara': '02', 'veljača': '02', 'veljače': '02',
+    'mart': '03', 'marta': '03', 'ožujak': '03', 'ožujka': '03',
+    'april': '04', 'aprila': '04', 'travanj': '04', 'travnja': '04',
+    'maj': '05', 'maja': '05', 'svibanj': '05', 'svibnja': '05',
+    'juni': '06', 'juna': '06', 'lipanj': '06', 'lipnja': '06',
+    'juli': '07', 'jula': '07', 'jul': '07', 'srpanj': '07', 'srpnja': '07',
+    'august': '08', 'augusta': '08', 'kolovoz': '08', 'kolovoza': '08',
+    'septembar': '09', 'septembra': '09', 'rujan': '09', 'rujna': '09',
+    'oktobar': '10', 'oktobara': '10', 'listopad': '10', 'listopada': '10',
+    'novembar': '11', 'novembra': '11', 'studeni': '11', 'studenog': '11',
+    'decembar': '12', 'decembra': '12', 'prosinac': '12', 'prosinca': '12'
+}
+
+def parse_relative_time(text):
+    now = datetime.now(CEST)
+    text_lower = text.lower()
+    
+    match_hours = re.search(r'prije\s+(\d+)\s*(h|sat|sata|sati)', text_lower)
+    if match_hours:
+        return now - timedelta(hours=int(match_hours.group(1)))
+        
+    match_mins = re.search(r'prije\s+(\d+)\s*(m|min|minuta|minute)', text_lower)
+    if match_mins:
+        return now - timedelta(minutes=int(match_mins.group(1)))
+
+    match_days = re.search(r'prije\s+(\d+)\s*(d|dan|dana)', text_lower)
+    if match_days:
+        return now - timedelta(days=int(match_days.group(1)))
+
+    return None
+
+def parse_date_safely(date_str):
+    if not date_str:
+        return None
+        
+    rel_dt = parse_relative_time(date_str)
+    if rel_dt:
+        return rel_dt
+
+    try:
+        clean_str = date_str.strip()
+        clean_str = re.sub(r'(\d{4})\d$', r'\1', clean_str)
+        clean_lower = clean_str.lower()
+        for month_name, month_num in MONTHS_MAP.items():
+            if month_name in clean_lower:
+                clean_lower = clean_lower.replace(month_name, month_num)
+                break
+                
+        return parser.parse(clean_lower, fuzzy=True)
+    except Exception:
+        return None
+
+def extract_published_date(url):
+    dt = None
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        html = response.text
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # 1. Specifično za Slobodnu Bosnu
+        if "slobodna-bosna.ba" in url:
+            sb_elem = soup.find('div', class_='info') or \
+                      soup.find('span', class_='date') or \
+                      soup.find('div', class_=re.compile(r'mini_market|vijest|article', re.I))
+            if sb_elem:
+                text_match = re.search(r'(\d{1,2}\.\s*[A-Za-zčćšžđČĆŠŽĐ]+\.\s*\d{4}\d?)|(prije\s+.*)', sb_elem.text, re.I)
+                if text_match:
+                    dt = parse_date_safely(text_match.group(0))
+
+        # 2. JSON-LD
+        if not dt:
+            scripts = soup.find_all('script', type='application/ld+json')
+            for script in scripts:
+                if not script.string:
+                    continue
+                try:
+                    data = json.loads(script.string)
+                    items = data if isinstance(data, list) else [data]
+                    for item in items:
+                        if isinstance(item, dict):
+                            graph = item.get('@graph', [item])
+                            for node in graph:
+                                if isinstance(node, dict) and 'datePublished' in node:
+                                    parsed = parse_date_safely(node['datePublished'])
+                                    if parsed:
+                                        dt = parsed
+                                        break
+                    if dt:
+                        break
+                except Exception:
+                    continue
+
+        # 3. Meta tagovi
+        if not dt and "slobodna-bosna.ba" not in url:
+            meta_selectors = [
+                {'property': 'article:published_time'},
+                {'name': 'publication_date'},
+                {'name': 'DC.date.issued'},
+                {'name': 'parsely-pub-date'},
+                {'itemprop': 'datePublished'}
+            ]
+            for selector in meta_selectors:
+                meta = soup.find('meta', attrs=selector)
+                if meta and meta.get('content'):
+                    dt = parse_date_safely(meta['content'])
+                    if dt:
+                        break
+
+        # 4. HTML <time> Tag
+        if not dt:
+            time_tag = soup.find('time')
+            if time_tag:
+                datetime_attr = time_tag.get('datetime') or time_tag.get('content')
+                if datetime_attr:
+                    dt = parse_date_safely(datetime_attr)
+                if not dt:
+                    dt = parse_date_safely(time_tag.text.strip())
+
+        # 5. Fallback htmldate
+        if not dt:
+            extracted_date_str = find_date(html)
+            if extracted_date_str:
+                dt = parse_date_safely(extracted_date_str)
+
+        if dt:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=CEST)
+            else:
+                dt = dt.astimezone(CEST)
+            return dt
+
+    except Exception as e:
+        pass
+        
+    return None
+
+# Web Interfejs (Streamlit UI)
+st.title("📅 Analizator Vremena Objave Članaka")
+st.write("Unesite listu URL-ova kako biste izvučeni datum i vrijeme objave poredali hronološki.")
+
+raw_input = st.text_area("Unesite URL-ove (jedan po redu):", height=150, placeholder="https://www.bbc.com/...\nhttps://www.slobodna-bosna.ba/...")
+
+sort_order = st.radio("Redoslijed sortiranja:", ("Najnovije prvo", "Najstarije prvo"), horizontal=True)
+
+if st.button("🚀 Pokreni analizu", type="primary"):
+    urls = [line.strip() for line in raw_input.splitlines() if line.strip() and not line.strip().startswith('#')]
+    
+    if not urls:
+        st.warning("Molimo unesite barem jedan ispravan URL.")
+    else:
+        results = []
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        for idx, url in enumerate(urls, 1):
+            status_text.text(f"Analiziram [{idx}/{len(urls)}]: {url}")
+            pub_date = extract_published_date(url)
+            results.append({'url': url, 'date': pub_date})
+            progress_bar.progress(idx / len(urls))
+
+        status_text.success("Analiza završena!")
+
+        valid_results = [r for r in results if r['date'] is not None]
+        failed_results = [r for r in results if r['date'] is None]
+
+        reverse_sort = True if sort_order == "Najnovije prvo" else False
+        valid_results.sort(key=lambda x: x['date'], reverse=reverse_sort)
+
+        final_data = valid_results + failed_results
+
+        # Prikaz rezultata u tabeli
+        table_rows = []
+        for idx, item in enumerate(final_data, 1):
+            date_str = item['date'].strftime('%Y-%m-%d %H:%M:%S CEST') if item['date'] else "-"
+            status = "Pronađeno" if item['date'] else "Nije pronađeno"
+            table_rows.append({"#": idx, "Datum i Vrijeme (CEST)": date_str, "Status": status, "URL": item['url']})
+
+        st.dataframe(table_rows, use_container_width=True)
+
+        # Generisanje fajlova za preuzimanje
+        st.subheader("📥 Preuzmi rezultate")
+        col1, col2 = st.columns(2)
+
+        # CSV Export
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow(['#', 'URL', 'Status', 'Datum i Vrijeme (CEST)'])
+        for row in table_rows:
+            writer.writerow([row['#'], row['URL'], row['Status'], row['Datum i Vrijeme (CEST)']])
+
+        col1.download_button(
+            label="Preuzmi kao CSV",
+            data=csv_buffer.getvalue(),
+            file_name="rezultati_analize.csv",
+            mime="text/csv"
+        )
+
+        # JSON Export
+        json_data = json.dumps([
+            {
+                "url": r['url'],
+                "status": "success" if r['date'] else "not_found",
+                "published_time_formatted": r['date'].strftime('%Y-%m-%d %H:%M:%S CEST') if r['date'] else None
+            } for r in final_data
+        ], ensure_ascii=False, indent=4)
+
+        col2.download_button(
+            label="Preuzmi kao JSON",
+            data=json_data,
+            file_name="rezultati_analize.json",
+            mime="application/json"
+        )
