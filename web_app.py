@@ -2,6 +2,7 @@ import json
 import csv
 import re
 from datetime import datetime, timezone, timedelta
+import requests
 from bs4 import BeautifulSoup
 from dateutil import parser
 from htmldate import find_date
@@ -11,6 +12,7 @@ import cloudscraper
 # Vremenska zona za našu regiju (CEST / UTC+2)
 CEST = timezone(timedelta(hours=2))
 
+# Mapa mjeseci na našim jezicima za sigurno parsiranje
 MONTHS_MAP = {
     'januar': '01', 'januara': '01', 'siječanj': '01', 'siječnja': '01',
     'februar': '02', 'februara': '02', 'veljača': '02', 'veljače': '02',
@@ -27,6 +29,7 @@ MONTHS_MAP = {
 }
 
 def parse_relative_time(text):
+    """Pretvara relativno vrijeme poput 'Prije 2h' ili 'prije 45 min' u datetime."""
     now = datetime.now(CEST)
     text_lower = text.lower()
     
@@ -54,7 +57,7 @@ def parse_date_safely(date_str):
 
     try:
         clean_str = date_str.strip()
-        clean_str = re.sub(r'(\d{4})\d$', r'\1', clean_str)
+        clean_str = re.sub(r'(\d{4})\d$', r'\1', clean_str) # Uklanja višku nulu na kraju godine (Slobodna Bosna)
         
         clean_lower = clean_str.lower()
         for month_name, month_num in MONTHS_MAP.items():
@@ -70,39 +73,55 @@ def extract_published_date(url):
     dt = None
     html = ""
     
+    # -------------------------------------------------------------
+    # 1. POKUŠAJ: Direktan upit preko Cloudscrapera
+    # -------------------------------------------------------------
     try:
-        # Inicijalizacija scrapera koji prolazi Cloudflare challenge
         scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'desktop': True
-            }
+            browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
         )
-        response = scraper.get(url, timeout=15)
-        if response.status_code == 200:
+        response = scraper.get(url, timeout=10)
+        if response.status_code == 200 and len(response.text) > 2000:
             html = response.text
-    except Exception as e:
-        print(f"[GREŠKA CLOUDSCRAPER] {url}: {e}")
-        return None
+    except Exception:
+        pass
+
+    # -------------------------------------------------------------
+    # 2. POKUŠAJ (JINA PROXY FALLBACK): Ako je Cloudflare blokirao server
+    # -------------------------------------------------------------
+    if not html or "Just a moment..." in html or "Enable JavaScript" in html:
+        try:
+            proxy_url = f"https://r.jina.ai/{url}"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
+                'X-With-Generated-Alt': 'true'
+            }
+            res = requests.get(proxy_url, headers=headers, timeout=15)
+            if res.status_code == 200:
+                html = res.text
+        except Exception as e:
+            print(f"[GREŠKA PROXY] {url}: {e}")
 
     if not html:
         return None
 
     soup = BeautifulSoup(html, 'html.parser')
 
-    # 1. Slobodna Bosna specifičnost
+    # -------------------------------------------------------------
+    # LOGIKA ZA EKSTRAKCIJU DATUMA
+    # -------------------------------------------------------------
+
+    # A) Specifično za Slobodnu Bosnu (Izbjegavanje lažnog meta taga)
     if "slobodna-bosna.ba" in url:
         sb_elem = soup.find('div', class_='info') or \
                   soup.find('span', class_='date') or \
                   soup.find('div', class_=re.compile(r'mini_market|vijest|article', re.I))
-        
         if sb_elem:
             text_match = re.search(r'(\d{1,2}\.\s*[A-Za-zčćšžđČĆŠŽĐ]+\.\s*\d{4}\d?)|(prije\s+.*)', sb_elem.text, re.I)
             if text_match:
                 dt = parse_date_safely(text_match.group(0))
 
-    # 2. JSON-LD
+    # B) JSON-LD (Dnevno.hr i standardni portali)
     if not dt:
         scripts = soup.find_all('script', type='application/ld+json')
         for script in scripts:
@@ -125,7 +144,7 @@ def extract_published_date(url):
             except Exception:
                 continue
 
-    # 3. Meta tagovi
+    # C) Meta tagovi (og:article:published_time, article:published_time, etc.)
     if not dt and "slobodna-bosna.ba" not in url:
         meta_selectors = [
             {'property': 'article:published_time'},
@@ -142,7 +161,7 @@ def extract_published_date(url):
                 if dt:
                     break
 
-    # 4. HTML5 <time> tagovi
+    # D) HTML5 <time> Tagovi
     if not dt:
         time_tags = soup.find_all('time')
         for tag in time_tags:
@@ -152,12 +171,20 @@ def extract_published_date(url):
                 if dt:
                     break
 
-    # 5. Fallback na htmldate
+    # E) Pretraživanje datuma u tekstu (Za Jina Proxy čist tekst)
+    if not dt:
+        text_content = soup.get_text()
+        date_match = re.search(r'(\d{1,2}\.\d{1,2}\.\d{4}\.?\s*(?:u\s*)?\d{1,2}:\d{2})|(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', text_content)
+        if date_match:
+            dt = parse_date_safely(date_match.group(0))
+
+    # F) Fallback na htmldate biblioteku
     if not dt:
         extracted_date_str = find_date(html)
         if extracted_date_str:
             dt = parse_date_safely(extracted_date_str)
 
+    # Normalizacija u CEST vremensku zonu
     if dt:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=CEST)
@@ -167,11 +194,15 @@ def extract_published_date(url):
 
     return None
 
+# ==============================================================================
+# STREAMLIT INTERFEJS
+# ==============================================================================
 def main():
     st.set_page_config(page_title="Analizator Vremena Objave Članaka", page_icon="⏱️", layout="wide")
     st.title("⏱️ Analizator Vremena Objave Članaka")
-    
-    urls_input = st.text_area("Unesite URL-ove ovdje:", height=180, placeholder="https://www.dnevno.hr/...\nhttps://www.slobodna-bosna.ba/...")
+    st.write("Unesite listu URL-ova kako biste izvučeni datum i vrijeme objave poredali hronološki.")
+
+    urls_input = st.text_area("Unesite URL-ove ovdje (svaki u novi red):", height=180, placeholder="https://www.dnevno.hr/...\nhttps://www.slobodna-bosna.ba/...")
 
     col1, _ = st.columns([1, 4])
     with col1:
