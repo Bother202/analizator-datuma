@@ -1,6 +1,6 @@
+streamlit
 requests
 beautifulsoup4
 python-dateutil
 htmldate
-streamlit
-cloudscraper
+playwright
