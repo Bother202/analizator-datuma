@@ -61,6 +61,7 @@ def parse_date_safely(date_str):
 
     try:
         clean_str = date_str.strip()
+        # Normalizacija raznih formata ispisa datuma
         clean_str = re.sub(r'(\d{1,2})[\/\.](\d{1,2})[\/\.](\d{4})\.?\s*(?:u|@)?\s*(\d{1,2}:\d{2})', r'\3-\2-\1 \4', clean_str)
         clean_str = re.sub(r'(\d{4})\d$', r'\1', clean_str)
         
@@ -98,7 +99,7 @@ def extract_image_upload_time(soup, session):
         except Exception:
             pass
 
-        # 2. Ekstrakcija datuma iz same putanje u URL-u slike (npr. /uploads/2026/07/30/...)
+        # 2. Ekstrakcija datuma iz same putanje u URL-u slike
         match_url = re.search(r'/uploads/(\d{4})/(\d{2})/(?:(\d{2})/)?', img_url)
         if match_url:
             year, month, day = match_url.group(1), match_url.group(2), match_url.group(3) or '01'
@@ -145,73 +146,90 @@ def extract_article_dates(url):
     # 1. IZVLAČENJE VREMENA IZ SOURCE CODE-a
     # ==========================================
     
-    # A) Meta tagovi
-    meta_selectors = [
-        {'property': 'article:published_time'}, {'name': 'article:published_time'},
-        {'property': 'og:article:published_time'}, {'name': 'published_at'},
-        {'property': 'published_at'}, {'name': 'publication_date'}, 
-        {'name': 'pubdate'}, {'property': 'og:pubdate'},
-        {'name': 'DC.date.issued'}, {'name': 'parsely-pub-date'}, {'itemprop': 'datePublished'}
-    ]
-    for selector in meta_selectors:
-        meta = soup.find('meta', attrs=selector)
-        if meta and meta.get('content'):
-            site_date = parse_date_safely(meta['content'])
-            if site_date:
-                break
+    # Pomagalo: Provjerava da li datum ima sat i minutu (tj. nije 00:00:00)
+    def has_full_time(dt):
+        return dt is not None and not (dt.hour == 0 and dt.minute == 0 and dt.second == 0)
 
-    # B) JSON-LD Metadati
-    if not site_date:
-        scripts = soup.find_all('script', type='application/ld+json')
-        for script in scripts:
-            if not script.string:
-                continue
-            try:
-                data = json.loads(script.string)
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if isinstance(item, dict):
-                        graph = item.get('@graph', [item])
-                        for node in graph:
-                            if isinstance(node, dict) and 'datePublished' in node:
-                                parsed = parse_date_safely(node['datePublished'])
-                                if parsed:
-                                    site_date = parsed
+    # A) JSON-LD Metadati (Često sadrže najprecizniji ISO timestamp sa satnicom)
+    scripts = soup.find_all('script', type='application/ld+json')
+    for script in scripts:
+        if not script.string:
+            continue
+        try:
+            data = json.loads(script.string)
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if isinstance(item, dict):
+                    graph = item.get('@graph', [item])
+                    for node in graph:
+                        if isinstance(node, dict) and 'datePublished' in node:
+                            parsed = parse_date_safely(str(node['datePublished']))
+                            if parsed:
+                                site_date = parsed
+                                if has_full_time(site_date):
                                     break
-                if site_date:
+                if has_full_time(site_date):
                     break
-            except Exception:
-                continue
+            if has_full_time(site_date):
+                break
+        except Exception:
+            continue
 
-    # C) HTML/Elementor Klase
-    if not site_date:
+    # B) Meta tagovi (Ako nismo našli potpunu satnicu u JSON-LD)
+    if not has_full_time(site_date):
+        meta_selectors = [
+            {'property': 'article:published_time'}, {'name': 'article:published_time'},
+            {'property': 'og:article:published_time'}, {'name': 'published_at'},
+            {'property': 'published_at'}, {'name': 'publication_date'}, 
+            {'name': 'pubdate'}, {'property': 'og:pubdate'},
+            {'name': 'DC.date.issued'}, {'name': 'parsely-pub-date'}, {'itemprop': 'datePublished'}
+        ]
+        for selector in meta_selectors:
+            meta = soup.find('meta', attrs=selector)
+            if meta and meta.get('content'):
+                parsed = parse_date_safely(meta['content'])
+                if parsed:
+                    # Zadržavamo samo ako je potpuniji od postojećeg
+                    if not site_date or has_full_time(parsed):
+                        site_date = parsed
+                    if has_full_time(site_date):
+                        break
+
+    # C) HTML5 <time> Tag
+    if not has_full_time(site_date):
+        time_tags = soup.find_all('time')
+        for tag in time_tags:
+            datetime_attr = tag.get('datetime') or tag.get('content') or tag.text.strip()
+            if datetime_attr:
+                parsed = parse_date_safely(datetime_attr)
+                if parsed:
+                    if not site_date or has_full_time(parsed):
+                        site_date = parsed
+                    if has_full_time(site_date):
+                        break
+
+    # D) HTML/Elementor/Večernji specifične klase u samom tekstu
+    if not has_full_time(site_date):
         date_classes = [
-            'elementor-post-info__item--type-date', 'post-info', 'date', 'news-date', 
-            'time', 'published', 'article-date', 'datum', 'vrijeme', 'post-date', 
-            'entry-date', 'clanak-datum', 'time-ago', 'publish-date', 'meta-date'
+            'article__date', 'article-date', 'elementor-post-info__item--type-date', 
+            'post-info', 'date', 'news-date', 'time', 'published', 'datum', 'vrijeme', 
+            'post-date', 'entry-date', 'clanak-datum', 'time-ago', 'publish-date', 'meta-date'
         ]
         for cls in date_classes:
             elements = soup.find_all(class_=re.compile(cls, re.I))
             for elem in elements:
                 text = elem.text.strip()
                 if re.search(r'\d{1,2}[\.\/-]\d{1,2}[\.\/-]\d{2,4}', text) or re.search(r'\d{1,2}:\d{2}', text):
-                    site_date = parse_date_safely(text)
-                    if site_date:
-                        break
-            if site_date:
+                    parsed = parse_date_safely(text)
+                    if parsed:
+                        if not site_date or has_full_time(parsed):
+                            site_date = parsed
+                        if has_full_time(site_date):
+                            break
+            if has_full_time(site_date):
                 break
 
-    # D) HTML5 <time> Tag
-    if not site_date:
-        time_tags = soup.find_all('time')
-        for tag in time_tags:
-            datetime_attr = tag.get('datetime') or tag.get('content') or tag.text.strip()
-            if datetime_attr:
-                site_date = parse_date_safely(datetime_attr)
-                if site_date:
-                    break
-
-    # E) HtmlDate Fallback
+    # E) HtmlDate Fallback (Samo ako do sada nismo našli ništa)
     if not site_date:
         extracted_date_str = find_date(html)
         if extracted_date_str:
