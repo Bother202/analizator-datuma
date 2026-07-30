@@ -27,9 +27,17 @@ MONTHS_MAP = {
 }
 
 BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'Accept-Language': 'bs,hr,sr,en-US;q=0.7,en;q=0.3',
+    'Sec-Ch-Ua': '"Not/A)Brand";v="8", "Chromium";v="126"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1'
 }
 
 def parse_relative_time(text):
@@ -60,6 +68,7 @@ def parse_date_safely(date_str):
 
     try:
         clean_str = date_str.strip()
+        # Formati poput 30/07/2026 u 09:18 ili 30.07.2026. 09:18
         clean_str = re.sub(r'(\d{1,2})[\/\.](\d{1,2})[\/\.](\d{4})\.?\s*(?:u|@)?\s*(\d{1,2}:\d{2})', r'\3-\2-\1 \4', clean_str)
         clean_str = re.sub(r'(\d{4})\d$', r'\1', clean_str)
         
@@ -75,25 +84,29 @@ def parse_date_safely(date_str):
         return None
 
 def extract_image_upload_time(soup, session):
-    """Izvlači vrijeme uploada featured slike preko Meta tagova i Last-Modified HTTP zaglavlja."""
+    """Izvlači vrijeme uploada featured slike preko Meta tagova, HEAD upita ili putanje u URL-u."""
     try:
-        # Pronalaženje glavne slike (og:image ili twitter:image)
         img_meta = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
         if not img_meta or not img_meta.get('content'):
             return None
 
         img_url = img_meta['content']
         
-        # 1. Pokušaj izvlačenja datuma iz URL-a slike (čest slučaj kod WordPressa: /uploads/2026/07/filename.jpg)
+        # 1. HEAD upit za Last-Modified zaglavlje
+        try:
+            head_res = session.head(img_url, timeout=5, allow_redirects=True)
+            if head_res.status_code == 200 and 'Last-Modified' in head_res.headers:
+                last_mod = head_res.headers['Last-Modified']
+                return parser.parse(last_mod)
+        except Exception:
+            pass
+
+        # 2. Ekstrakcija datuma iz same putanje slike (npr. /uploads/2026/07/30/...)
         match_url = re.search(r'/uploads/(\d{4})/(\d{2})/(?:(\d{2})/)?', img_url)
-        
-        # 2. Slanje HEAD zahtjeva medijskom serveru za preuzimanje Last-Modified zaglavlja
-        head_res = session.head(img_url, timeout=5, allow_redirects=True)
-        if head_res.status_code == 200 and 'Last-Modified' in head_res.headers:
-            last_mod = head_res.headers['Last-Modified']
-            dt = parser.parse(last_mod)
-            return dt
-            
+        if match_url:
+            year, month, day = match_url.group(1), match_url.group(2), match_url.group(3) or '01'
+            return datetime(int(year), int(month), int(day))
+
     except Exception:
         pass
     return None
@@ -105,56 +118,51 @@ def extract_published_date(url):
     session = requests.Session()
     session.headers.update(BROWSER_HEADERS)
     
-    # 1. DOHVAT HTML SADRŽAJA
+    # 1. DIREKTNI ZAHTJEV
     try:
-        response = session.get(url, timeout=12, allow_redirects=True)
+        response = session.get(url, timeout=10, allow_redirects=True)
         if response.status_code == 200 and len(response.text) > 1000:
             html = response.text
     except Exception:
         pass
 
-    if not html or "Just a moment..." in html:
-        proxy_urls = [f"https://r.jina.ai/{url}", f"https://api.allorigins.win/raw?url={url}"]
+    # 2. PROXY FALLBACK (Agresivni servisi za obilazak Cloudflare-a na Etto.ba, Dnevno.hr, itd.)
+    if not html or "Just a moment..." in html or "Attention Required!" in html or "530 Check" in html:
+        proxy_urls = [
+            f"https://r.jina.ai/{url}",
+            f"https://txt.rohit.surf/{url}",
+            f"https://api.allorigins.win/raw?url={url}"
+        ]
         for p_url in proxy_urls:
             try:
                 r = session.get(p_url, timeout=12)
-                if r.status_code == 200 and len(r.text) > 1000:
+                if r.status_code == 200 and len(r.text) > 500:
                     html = r.text
                     break
             except Exception:
                 continue
 
     if not html:
-        return None, None
+        return None, "Nije moguće pristupiti sajtu"
 
     soup = BeautifulSoup(html, 'html.parser')
 
-    # A) SPECIFIČNO ZA SLOBODNU BOSNU
-    if "slobodna-bosna.ba" in url:
-        sb_elem = soup.find('div', class_='info') or \
-                  soup.find('span', class_='date') or \
-                  soup.find('div', class_=re.compile(r'mini_market|vijest|article', re.I))
-        if sb_elem:
-            text_match = re.search(r'(\d{1,2}\.\s*[A-Za-zčćšžđČĆŠŽĐ]+\.\s*\d{4}\d?)|(prije\s+.*)', sb_elem.text, re.I)
-            if text_match:
-                dt = parse_date_safely(text_match.group(0))
+    # A) PARSIRANJE META TAGOVA (Etto.ba, Slobodna Bosna, Dnevno)
+    meta_selectors = [
+        {'property': 'article:published_time'}, {'name': 'article:published_time'},
+        {'property': 'og:article:published_time'}, {'name': 'published_at'},
+        {'property': 'published_at'}, {'name': 'publication_date'}, 
+        {'name': 'pubdate'}, {'property': 'og:pubdate'},
+        {'name': 'DC.date.issued'}, {'name': 'parsely-pub-date'}, {'itemprop': 'datePublished'}
+    ]
+    for selector in meta_selectors:
+        meta = soup.find('meta', attrs=selector)
+        if meta and meta.get('content'):
+            dt = parse_date_safely(meta['content'])
+            if dt:
+                break
 
-    # B) META TAGOVI
-    if not dt:
-        meta_selectors = [
-            {'name': 'published_at'}, {'property': 'published_at'},
-            {'property': 'article:published_time'}, {'property': 'og:article:published_time'},
-            {'name': 'publication_date'}, {'name': 'pubdate'}, {'property': 'og:pubdate'},
-            {'name': 'DC.date.issued'}, {'name': 'parsely-pub-date'}, {'itemprop': 'datePublished'}
-        ]
-        for selector in meta_selectors:
-            meta = soup.find('meta', attrs=selector)
-            if meta and meta.get('content'):
-                dt = parse_date_safely(meta['content'])
-                if dt:
-                    break
-
-    # C) JSON-LD METADATI
+    # B) JSON-LD METADATI
     if not dt:
         scripts = soup.find_all('script', type='application/ld+json')
         for script in scripts:
@@ -177,11 +185,12 @@ def extract_published_date(url):
             except Exception:
                 continue
 
-    # D) HTML I ELEMENTOR KLASSE
+    # C) HTML/ELEMENTOR KLASE I SPECIFIČNE STRUCTURE (Etto.ba, Fokus, Nezavisne)
     if not dt:
         date_classes = [
             'elementor-post-info__item--type-date', 'post-info', 'date', 'news-date', 
-            'time', 'published', 'article-date', 'datum', 'vrijeme', 'post-date', 'entry-date'
+            'time', 'published', 'article-date', 'datum', 'vrijeme', 'post-date', 
+            'entry-date', 'clanak-datum', 'time-ago', 'publish-date'
         ]
         for cls in date_classes:
             elements = soup.find_all(class_=re.compile(cls, re.I))
@@ -194,7 +203,7 @@ def extract_published_date(url):
             if dt:
                 break
 
-    # E) HTML5 <time> TAG
+    # D) HTML5 <time> TAG
     if not dt:
         time_tags = soup.find_all('time')
         for tag in time_tags:
@@ -204,17 +213,28 @@ def extract_published_date(url):
                 if dt:
                     break
 
+    # E) REGEX PRETRAGA PO TEKSTU AKO JE PROXY VRATIO REFRESH/CLEAN TEKST
+    if not dt:
+        text_content = soup.get_text()
+        date_match = re.search(r'(\d{1,2}[\.\/-]\d{1,2}[\.\/-]\d{4}\.?\s*(?:u\s*)?\d{1,2}:\d{2})', text_content)
+        if date_match:
+            dt = parse_date_safely(date_match.group(0))
+
     # F) FALLBACK HTMLDATE
     if not dt:
         extracted_date_str = find_date(html)
         if extracted_date_str:
             dt = parse_date_safely(extracted_date_str)
 
-    # G) NEMA VREMENA (Samo datum sa 00:00:00) ILI NEMA DATUMA UOPŠTE -> POKUŠAJ PREKO FEATURED SLIKE
+    # G) AKO JE SAMO DATUM BEZ SATI (00:00:00) ILI NIJE NAĐEN - PROVJERI FEATURED SLIKU
     if not dt or (dt.hour == 0 and dt.minute == 0 and dt.second == 0):
         img_dt = extract_image_upload_time(soup, session)
         if img_dt:
-            dt = img_dt
+            # Ako smo imali samo datum, spajamo sat iz slike sa tim datumom
+            if dt:
+                dt = dt.replace(hour=img_dt.hour, minute=img_dt.minute, second=img_dt.second)
+            else:
+                dt = img_dt
             source_type = "Featured Slika (Procjena)"
 
     # Pretvaranje u CEST vremensku zonu
@@ -239,7 +259,7 @@ def main():
     urls_input = st.text_area(
         "Unesite URL-ove ovdje:", 
         height=180, 
-        placeholder="https://www.slobodna-bosna.ba/...\nhttps://www.fokus.ba/...\nhttps://www.dnevno.hr/..."
+        placeholder="https://etto.ba/clanak/...\nhttps://www.slobodna-bosna.ba/...\nhttps://www.fokus.ba/..."
     )
 
     col1, _ = st.columns([1, 4])
